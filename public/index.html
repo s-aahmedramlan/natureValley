@@ -3,63 +3,89 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Meeting Assistant</title>
+    <title>Discovery Assistant</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,300&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/styles.css" />
     <script src="https://accounts.google.com/gsi/client" async defer></script>
   </head>
   <body>
-    <!-- Login screen (only shown when Google login is configured) -->
-    <div id="login" class="login-container" style="display: none">
-      <div class="login-card">
-        <h1 class="setup-title">Discovery Assistant</h1>
-        <p class="setup-sub">Sign in to run interviews and keep your library.</p>
-        <div id="google-btn" class="google-btn-wrap"></div>
-        <div id="login-error" class="error-alert" style="display: none"></div>
+
+    <!-- Login screen -->
+    <div id="login" class="auth-screen" style="display: none">
+      <canvas id="login-canvas" class="auth-canvas"></canvas>
+      <div class="auth-bg-overlay"></div>
+      <div class="auth-left">
+        <div class="auth-wordmark">Discovery<br/><em>Assistant</em></div>
+        <p class="auth-tagline">Made by 100pivots</p>
+      </div>
+      <div class="auth-right">
+        <div class="auth-form">
+          <h1 class="auth-title">Sign in</h1>
+          <p class="auth-sub">Sign in to run interviews and keep your library.</p>
+          <div id="google-btn" class="google-btn-wrap"></div>
+          <div id="login-error" class="error-alert" style="display: none"></div>
+        </div>
       </div>
     </div>
+
     <!-- Setup screen -->
-    <div id="setup" class="setup-container" style="display: none">
-      <div class="setup-card">
-        <div class="setup-topline">
-          <h1 class="setup-title">Discovery Assistant</h1>
-          <button id="open-library" class="library-chip">📁 Library <span id="library-count">0</span></button>
-        </div>
-        <div class="setup-userrow">
-          <p class="setup-sub" style="margin: 0">Live questions & domain tips while you interview.</p>
+    <div id="setup" class="auth-screen" style="display: none">
+      <canvas id="setup-canvas" class="auth-canvas"></canvas>
+      <div class="auth-bg-overlay"></div>
+      <div class="auth-left">
+        <div class="auth-wordmark">Discovery<br/><em>Assistant</em></div>
+        <p class="auth-tagline">Made by 100pivots</p>
+      </div>
+      <div class="auth-right">
+        <div class="auth-form">
+          <div class="setup-topline">
+            <h1 class="auth-title">Start Discovery</h1>
+            <button id="open-library" class="library-chip">Library <span id="library-count">0</span></button>
+          </div>
           <div id="user-chip" class="user-chip" style="display: none">
             <span id="user-email"></span>
             <button id="logout-btn" class="logout-link">Sign out</button>
           </div>
-        </div>
 
-        <div id="setup-error" class="error-alert" style="display: none"></div>
-        <div class="form-group">
-          <input id="your-name" class="form-input" type="text" placeholder="Your name (interviewer)" />
-          <input id="their-name" class="form-input" type="text" placeholder="Their name (interviewee)" />
-          <input
-            id="deepgram-key"
-            class="form-input"
-            type="password"
-            placeholder="Deepgram API key"
-            style="display: none"
-          />
-          <div>
-            <label class="form-label">Pre-meeting notes (optional)</label>
-            <textarea
-              id="premeeting-notes"
-              class="form-textarea"
-              rows="3"
-              placeholder="Company, industry, role, known pain points, what you want to learn..."
-            ></textarea>
+          <div id="setup-error" class="error-alert" style="display: none"></div>
+          <div class="form-group">
+            <div class="form-field">
+              <label class="form-label">Your name</label>
+              <input id="your-name" class="form-input" type="text" placeholder="Interviewer" />
+            </div>
+            <div class="form-field">
+              <label class="form-label">Their name</label>
+              <input id="their-name" class="form-input" type="text" placeholder="Interviewee" />
+            </div>
+            <input
+              id="deepgram-key"
+              class="form-input"
+              type="password"
+              placeholder="Deepgram API key"
+              style="display: none"
+            />
+            <div class="form-field">
+              <label class="form-label">Pre-meeting notes <span class="form-label-opt">optional</span></label>
+              <textarea
+                id="premeeting-notes"
+                class="form-textarea"
+                rows="3"
+                placeholder="Company, industry, role, known pain points..."
+              ></textarea>
+            </div>
+            <button id="start-btn" class="submit-btn">Start Discovery &rarr;</button>
           </div>
 
-          <div class="setup-hint">
-            <strong>How audio works:</strong> Your mic = <em>you</em>. To capture the other
-            person, you'll be asked to share your meeting tab — pick the tab and check
-            <em>"Also share tab audio."</em> That becomes <em>them</em>.
+          <div id="safari-banner" class="safari-banner" style="display: none">
+            <span>Tab audio requires Chrome or Edge. Safari cannot capture another tab's audio.</span>
+            <a href="https://www.google.com/chrome/" target="_blank" rel="noopener" class="safari-chrome-btn">Get Chrome</a>
           </div>
 
-          <button id="start-btn" class="submit-btn">Start session →</button>
+          <div class="contact-row">
+            On Safari or need help? <a href="https://x.com/100pivots" target="_blank" rel="noopener" class="contact-link">Message us</a>
+          </div>
         </div>
       </div>
     </div>
@@ -73,8 +99,8 @@
             <p id="library-sub" class="library-subtitle">Your saved discovery calls</p>
           </div>
           <div class="library-header-actions">
-            <button id="synthesize-btn" class="btn btn-primary">✦ Synthesize all</button>
-            <button id="library-back" class="btn">← Back</button>
+            <button id="synthesize-btn" class="btn btn-primary">Synthesize all</button>
+            <button id="library-back" class="btn">Back</button>
           </div>
         </div>
 
@@ -91,6 +117,9 @@
         <div class="top-bar">
           <div class="top-bar-left">
             <div id="rec-dot" class="recording-dot"></div>
+            <div id="mic-bars" class="mic-bars">
+              <span></span><span></span><span></span><span></span><span></span>
+            </div>
             <span id="timer" class="timer">00:00</span>
             <span id="audio-status" class="audio-status"></span>
           </div>
@@ -135,16 +164,16 @@
               <div class="summary-title">Call debrief</div>
               <div id="summary-meta" class="summary-meta"></div>
             </div>
-            <button id="summary-close" class="btn">✕</button>
+            <button id="summary-close" class="btn">x</button>
           </div>
 
           <div id="summary-body" class="summary-body">
-            <div class="summary-loading">Analyzing the conversation…</div>
+            <div class="summary-loading">Analyzing the conversation...</div>
           </div>
 
           <div class="summary-actions">
-            <button id="dl-transcript" class="btn">⬇ Transcript</button>
-            <button id="dl-summary" class="btn">⬇ Summary</button>
+            <button id="dl-transcript" class="btn">Download transcript</button>
+            <button id="dl-summary" class="btn">Download summary</button>
             <button id="new-session" class="btn btn-primary">New session</button>
           </div>
         </div>
@@ -152,11 +181,11 @@
 
       <!-- Debug panel -->
       <div id="debug-panel">
-        <div class="debug-title" id="debug-toggle">🔧 Debug ▾</div>
+        <div class="debug-title" id="debug-toggle">Debug</div>
         <div id="debug-body">
           <div class="debug-stats">
-            <div>You (mic): <span id="dbg-you">⚫</span></div>
-            <div>Them (tab): <span id="dbg-them">⚫</span></div>
+            <div>You (mic): <span id="dbg-you">off</span></div>
+            <div>Them (tab): <span id="dbg-them">off</span></div>
             <div>Utterances: <span id="dbg-utterances">0</span></div>
           </div>
           <div class="debug-logs-label">Logs:</div>

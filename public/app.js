@@ -5,7 +5,6 @@ const state = {
   deepgramKey: '',
   premeetingNotes: '',
   transcript: [],
-  // questions: array of { text, pinned }
   questions: [],
   tips: [],
   summary: null,
@@ -39,6 +38,40 @@ function updateDebugStats() {
   $('dbg-utterances').textContent = state.transcript.length;
 }
 
+// ---- Pixelate reveal animation ----
+function pixelateReveal(canvas) {
+  if (!canvas) return;
+  const img = new Image();
+  img.onload = () => {
+    const w = canvas.offsetWidth;
+    const h = canvas.offsetHeight;
+    if (!w || !h) return;
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    const steps  = [32, 16, 8, 4, 2, 0];
+    const delays = [0, 90, 170, 270, 400, 560];
+    steps.forEach((size, i) => {
+      setTimeout(() => {
+        if (size === 0) {
+          ctx.imageSmoothingEnabled = true;
+          ctx.drawImage(img, 0, 0, w, h);
+          return;
+        }
+        const tw = Math.max(1, Math.ceil(w / size));
+        const th = Math.max(1, Math.ceil(h / size));
+        const off = document.createElement('canvas');
+        off.width = tw;
+        off.height = th;
+        off.getContext('2d').drawImage(img, 0, 0, tw, th);
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(off, 0, 0, tw, th, 0, 0, w, h);
+      }, delays[i]);
+    });
+  };
+  img.src = '/bg.jpg';
+}
+
 // ---- Boot + auth ----
 let currentUser = null;
 
@@ -65,7 +98,7 @@ async function boot() {
       showSetup();
     } else {
       showLogin(cfg.googleClientId);
-      return; // don't load library until signed in
+      return;
     }
   } else {
     showSetup();
@@ -73,19 +106,34 @@ async function boot() {
   refreshLibraryCount();
 }
 
-function showSetup() {
-  $('login').style.display = 'none';
-  $('setup').style.display = 'flex';
-  if (currentUser) {
-    $('user-chip').style.display = 'flex';
-    $('user-email').textContent = currentUser.email;
-  }
+function isSafari() {
+  const ua = navigator.userAgent;
+  return ua.includes('Safari') && !ua.includes('Chrome') && !ua.includes('Chromium') && !ua.includes('CriOS');
 }
+
 
 function showLogin(clientId) {
   $('setup').style.display = 'none';
   $('login').style.display = 'flex';
+  pixelateReveal($('login-canvas'));
   initGoogleButton(clientId);
+}
+
+function showSetup() {
+  $('login').style.display = 'none';
+  $('setup').style.display = 'flex';
+  pixelateReveal($('setup-canvas'));
+  if (isSafari()) {
+    $('safari-banner').style.display = 'flex';
+    const btn = $('start-btn');
+    btn.disabled = true;
+    btn.style.opacity = '0.35';
+    btn.style.cursor = 'not-allowed';
+  }
+  if (currentUser) {
+    $('user-chip').style.display = 'flex';
+    $('user-email').textContent = currentUser.email;
+  }
 }
 
 function initGoogleButton(clientId, tries = 0) {
@@ -157,33 +205,31 @@ async function startSession() {
     return;
   }
 
-  // Capture audio BEFORE switching screens, so permission prompts have context
   try {
-    addDebugLog('🎤 Requesting microphone (you)...');
+    addDebugLog('Requesting microphone...');
     micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    addDebugLog('✓ Mic granted');
+    addDebugLog('Mic granted');
   } catch (err) {
     showSetupError('Microphone access denied — needed to capture your side.');
     return;
   }
 
   try {
-    addDebugLog('🖥️ Requesting tab audio (them)... pick your meeting tab + "share tab audio"');
+    addDebugLog('Requesting tab audio — pick your meeting tab and check "Share tab audio"');
     displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
     const audioTracks = displayStream.getAudioTracks();
-    displayStream.getVideoTracks().forEach((t) => t.stop()); // we only want audio
+    displayStream.getVideoTracks().forEach((t) => t.stop());
     if (audioTracks.length === 0) {
-      addDebugLog('⚠️ No tab audio shared — "them" will not be transcribed. (Re-start and check "share tab audio".)');
+      addDebugLog('No tab audio shared — only your mic will be transcribed.');
       displayStream = null;
     } else {
-      addDebugLog('✓ Tab audio granted (them)');
+      addDebugLog('Tab audio granted');
     }
   } catch (err) {
-    addDebugLog('⚠️ Tab audio skipped — only your side will be transcribed.');
+    addDebugLog('Tab audio skipped — only your mic will be transcribed.');
     displayStream = null;
   }
 
-  // Switch to recording view
   $('setup-error').style.display = 'none';
   $('setup').style.display = 'none';
   $('app').style.display = 'flex';
@@ -199,7 +245,7 @@ async function startSession() {
   state.savedId = null;
   state.lastGeneratedWordCount = 0;
 
-  addDebugLog(`🎙️ Session started`);
+  addDebugLog('Session started');
 
   timerInterval = setInterval(() => {
     state.elapsedSeconds++;
@@ -208,14 +254,13 @@ async function startSession() {
     $('timer').textContent = `${m}:${s}`;
   }, 1000);
 
-  // One Deepgram connection per stream — speaker is known per stream, no guessing
   startDeepgram(micStream, 'you');
   if (displayStream) startDeepgram(displayStream, 'them');
 }
 
-// ---- Deepgram (one connection per audio stream) ----
+// ---- Deepgram ----
 function startDeepgram(stream, role) {
-  addDebugLog(`🔗 Connecting Deepgram for ${role}...`);
+  addDebugLog(`Connecting Deepgram (${role})...`);
   const ws = new WebSocket(
     'wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model=nova-2&smart_format=true&interim_results=false',
     ['token', state.deepgramKey]
@@ -223,11 +268,10 @@ function startDeepgram(stream, role) {
   const conn = { ws, role, audioContext: null, processor: null, connected: false };
   conns.push(conn);
 
-  // Watchdog: if it doesn't open within 6s, the key/network is the problem
   const watchdog = setTimeout(() => {
     if (!conn.connected) {
       const msg = `Deepgram (${role}) not connecting — likely an invalid or out-of-credit key.`;
-      addDebugLog(`⏱️ ${msg}`);
+      addDebugLog(msg);
       $('api-error').textContent = msg;
       $('api-error').style.display = 'block';
     }
@@ -236,8 +280,8 @@ function startDeepgram(stream, role) {
   ws.onopen = () => {
     conn.connected = true;
     clearTimeout(watchdog);
-    addDebugLog(`✅ Deepgram connected (${role})`);
-    $(role === 'you' ? 'dbg-you' : 'dbg-them').textContent = '🔴';
+    addDebugLog(`Deepgram connected (${role})`);
+    $(role === 'you' ? 'dbg-you' : 'dbg-them').textContent = 'live';
     if (role === 'you') $('rec-dot').classList.add('active');
 
     const audioContext = new AudioContext({ sampleRate: 16000 });
@@ -246,14 +290,35 @@ function startDeepgram(stream, role) {
     conn.audioContext = audioContext;
     conn.processor = processor;
 
+    const micBars = role === 'you' ? $('mic-bars') : null;
+    const barEls = micBars ? Array.from(micBars.children) : [];
+    const BAR_HEIGHTS = [5, 9, 13, 9, 5]; // resting shape
+
     processor.onaudioprocess = (e) => {
       if (ws.readyState !== WebSocket.OPEN) return;
       const f32 = e.inputBuffer.getChannelData(0);
       const i16 = new Int16Array(f32.length);
+      let rms = 0;
       for (let i = 0; i < f32.length; i++) {
         i16[i] = Math.max(-32768, Math.min(32767, Math.round(f32[i] * 32767)));
+        rms += f32[i] * f32[i];
       }
       ws.send(i16.buffer);
+
+      if (micBars) {
+        rms = Math.sqrt(rms / f32.length);
+        const level = Math.min(1, rms * 12); // scale to 0-1
+        if (level > 0.01) {
+          micBars.classList.add('active');
+          barEls.forEach((bar, i) => {
+            const h = BAR_HEIGHTS[i] + level * (16 - BAR_HEIGHTS[i]) * (0.6 + Math.random() * 0.4);
+            bar.style.height = `${h}px`;
+          });
+        } else {
+          micBars.classList.remove('active');
+          barEls.forEach((bar, i) => { bar.style.height = `${BAR_HEIGHTS[i]}px`; });
+        }
+      }
     };
     source.connect(processor);
     processor.connect(audioContext.destination);
@@ -265,26 +330,24 @@ function startDeepgram(stream, role) {
       const alt = data.channel?.alternatives?.[0];
       const text = (alt?.transcript || '').trim();
       if (text && data.is_final) {
-        addDebugLog(`📝 [${role}] "${text}"`);
+        addDebugLog(`[${role}] "${text}"`);
         addUtterance(text, role);
       }
     } catch (err) {
-      addDebugLog(`❌ Parse error: ${err.message}`);
+      addDebugLog(`Parse error: ${err.message}`);
     }
   };
 
-  ws.onerror = () => addDebugLog(`❌ Deepgram socket error (${role})`);
+  ws.onerror = () => addDebugLog(`Deepgram socket error (${role})`);
   ws.onclose = (e) => {
     clearTimeout(watchdog);
-    const reason = e.reason || '(no reason given)';
-    addDebugLog(`⛔ Deepgram closed (${role}) code=${e.code} reason=${reason}`);
-    // 1008 / 4001-4009 = auth or payload problems; if it never connected, it's the key
+    addDebugLog(`Deepgram closed (${role}) code=${e.code}`);
     if (!conn.connected) {
-      const msg = `Deepgram (${role}) refused the connection (code ${e.code}). Your key is likely invalid or out of credits.`;
+      const msg = `Deepgram (${role}) refused the connection (code ${e.code}). Key may be invalid or out of credits.`;
       $('api-error').textContent = msg;
       $('api-error').style.display = 'block';
     }
-    $(role === 'you' ? 'dbg-you' : 'dbg-them').textContent = '⚫';
+    $(role === 'you' ? 'dbg-you' : 'dbg-them').textContent = 'off';
   };
 }
 
@@ -298,7 +361,6 @@ function addUtterance(text, speaker) {
   renderTranscript();
   updateDebugStats();
 
-  // Trigger questions after a pause, once the interviewee has shared enough new material
   const intervieweeWords = state.transcript
     .filter((t) => t.speaker === 'them')
     .reduce((n, t) => n + t.text.split(/\s+/).length, 0);
@@ -339,7 +401,7 @@ function renderTranscript() {
     const flip = document.createElement('button');
     flip.className = 'flip-btn';
     flip.title = 'Reassign speaker';
-    flip.textContent = '↔';
+    flip.textContent = '\u21C4';
     flip.onclick = (e) => {
       e.stopPropagation();
       item.speaker = item.speaker === 'them' ? 'you' : 'them';
@@ -353,7 +415,7 @@ function renderTranscript() {
   feed.scrollTop = feed.scrollHeight;
 }
 
-// ---- Questions (pinnable) ----
+// ---- Questions ----
 function renderQuestions() {
   const container = $('questions-container');
   const placeholder = $('questions-placeholder');
@@ -380,14 +442,13 @@ function renderQuestions() {
     if (q.pinned) {
       const badge = document.createElement('span');
       badge.className = 'pin-badge';
-      badge.textContent = '📌 pinned';
+      badge.textContent = 'pinned';
       card.appendChild(badge);
     }
 
-    // Click to pin/unpin. Pinned questions are never replaced on refresh.
     card.onclick = () => {
       q.pinned = !q.pinned;
-      addDebugLog(q.pinned ? '📌 Question pinned' : '📍 Question unpinned');
+      addDebugLog(q.pinned ? 'Question pinned' : 'Question unpinned');
       renderQuestions();
     };
 
@@ -397,7 +458,7 @@ function renderQuestions() {
   const meta = document.createElement('div');
   meta.className = 'questions-meta';
   meta.innerHTML = state.questionLoading
-    ? '<span class="spinner spinner-sm"></span> updating…'
+    ? '<span class="spinner spinner-sm"></span> updating...'
     : 'click a question to pin it';
   container.appendChild(meta);
 }
@@ -414,7 +475,7 @@ async function generateQuestions() {
   state.questionLoading = true;
   $('api-error').style.display = 'none';
   renderQuestions();
-  addDebugLog('🤖 Asking Claude...');
+  addDebugLog('Asking Claude...');
 
   try {
     const res = await fetch('/api/questions', {
@@ -425,13 +486,12 @@ async function generateQuestions() {
     const data = await res.json();
 
     if (!res.ok) {
-      addDebugLog(`❌ ${data.error || res.status}`);
+      addDebugLog(data.error || `Error ${res.status}`);
       $('api-error').textContent = data.error || `Error ${res.status}`;
       $('api-error').style.display = 'block';
       return;
     }
 
-    // Merge: keep pinned questions in place, replace only unpinned slots
     const incoming = data.questions || [];
     const merged = [];
     let nextIncoming = 0;
@@ -444,18 +504,16 @@ async function generateQuestions() {
         nextIncoming++;
       }
     }
-    // If pins consumed slots but we still have a fresh question, fill remaining
     while (merged.length < 2 && incoming[nextIncoming]) {
       merged.push({ text: incoming[nextIncoming], pinned: false });
       nextIncoming++;
     }
     state.questions = merged;
-
     state.tips = data.tips || [];
-    addDebugLog('✅ Questions + tips updated');
+    addDebugLog('Questions updated');
     renderTips();
   } catch (err) {
-    addDebugLog(`❌ Request failed: ${err.message}`);
+    addDebugLog(`Request failed: ${err.message}`);
     $('api-error').textContent = err.message;
     $('api-error').style.display = 'block';
   } finally {
@@ -494,9 +552,8 @@ function stopSession() {
   if (timerInterval) clearInterval(timerInterval);
   $('rec-dot').classList.remove('active');
   $('audio-status').textContent = '· stopped';
-  addDebugLog('⏹️ Stopped');
+  addDebugLog('Stopped');
 
-  // Open the debrief and generate a summary
   $('summary-overlay').style.display = 'flex';
   const m = String(Math.floor(state.elapsedSeconds / 60)).padStart(2, '0');
   const s = String(state.elapsedSeconds % 60).padStart(2, '0');
@@ -512,7 +569,7 @@ async function generateSummary() {
     return;
   }
 
-  body.innerHTML = '<div class="loading-state"><div class="spinner"></div><span>Analyzing the conversation…</span></div>';
+  body.innerHTML = '<div class="loading-state"><div class="spinner"></div><span>Analyzing the conversation...</span></div>';
 
   try {
     const res = await fetch('/api/summary', {
@@ -522,17 +579,17 @@ async function generateSummary() {
     });
     const data = await res.json();
     if (!res.ok) {
-      body.innerHTML = `<div class="summary-error">Couldn't generate summary: ${data.error || res.status}</div>`;
-      addDebugLog(`❌ Summary failed: ${data.error || res.status}`);
+      body.innerHTML = `<div class="summary-error">Could not generate summary: ${data.error || res.status}</div>`;
+      addDebugLog(`Summary failed: ${data.error || res.status}`);
       return;
     }
     state.summary = data.summary;
     renderSummary(data.summary);
-    addDebugLog('✅ Summary generated');
+    addDebugLog('Summary generated');
     saveSession();
   } catch (err) {
-    body.innerHTML = `<div class="summary-error">Couldn't generate summary: ${err.message}</div>`;
-    addDebugLog(`❌ Summary error: ${err.message}`);
+    body.innerHTML = `<div class="summary-error">Could not generate summary: ${err.message}</div>`;
+    addDebugLog(`Summary error: ${err.message}`);
   }
 }
 
@@ -573,7 +630,7 @@ function renderSummary(sum) {
     ul.className = 'summary-list' + (key === 'quotes' ? ' summary-quotes' : '');
     items.forEach((item) => {
       const li = document.createElement('li');
-      li.textContent = key === 'quotes' ? `“${item}”` : item;
+      li.textContent = key === 'quotes' ? `"${item}"` : item;
       ul.appendChild(li);
     });
     sec.appendChild(ul);
@@ -611,7 +668,7 @@ function downloadSummary() {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
-  addDebugLog('⬇️ Summary downloaded');
+  addDebugLog('Summary downloaded');
 }
 
 function buildMarkdown() {
@@ -640,7 +697,7 @@ function downloadTranscript() {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
-  addDebugLog('⬇️ Transcript downloaded');
+  addDebugLog('Transcript downloaded');
 }
 
 // ---- Persistence ----
@@ -664,10 +721,10 @@ async function saveSession() {
     });
     const data = await res.json();
     state.savedId = data.session?.id;
-    addDebugLog('💾 Saved to library');
+    addDebugLog('Saved to library');
     refreshLibraryCount();
   } catch (err) {
-    addDebugLog(`❌ Save failed: ${err.message}`);
+    addDebugLog(`Save failed: ${err.message}`);
   }
 }
 
@@ -683,18 +740,19 @@ async function openLibrary() {
   $('setup').style.display = 'none';
   $('library').style.display = 'block';
   $('synthesis-panel').style.display = 'none';
-  $('library-list').innerHTML = '<div class="library-empty">Loading…</div>';
+  $('library-list').innerHTML = '<div class="library-empty">Loading...</div>';
   try {
     const data = await (await fetch('/api/sessions')).json();
     renderLibrary(data.sessions || []);
   } catch (err) {
-    $('library-list').innerHTML = `<div class="library-empty">Couldn't load library: ${err.message}</div>`;
+    $('library-list').innerHTML = `<div class="library-empty">Could not load library: ${err.message}</div>`;
   }
 }
 
 function closeLibrary() {
   $('library').style.display = 'none';
   $('setup').style.display = 'flex';
+  pixelateReveal($('setup-canvas'));
 }
 
 function renderLibrary(sessions) {
@@ -723,7 +781,7 @@ function renderLibrary(sessions) {
         <div class="session-tldr">${escapeHtml(s.summary?.tldr || 'No summary')}</div>
         <div class="session-meta">${s.date || ''} · ${mins} min · ${s.lineCount || 0} lines · ${painCount} pain point${painCount === 1 ? '' : 's'}</div>
       </div>
-      <button class="session-del" title="Delete">✕</button>
+      <button class="session-del" title="Delete">x</button>
     `;
 
     card.querySelector('.session-main').onclick = () => openSession(s.id);
@@ -740,7 +798,6 @@ async function openSession(id) {
     const data = await (await fetch(`/api/sessions/${id}`)).json();
     const s = data.session;
     if (!s) return;
-    // Load into state so the existing debrief modal + downloads work
     state.sessionStartTime = new Date(s.createdAt || Date.now()).getTime();
     state.yourName = s.interviewer;
     state.theirName = s.interviewee;
@@ -756,7 +813,7 @@ async function openSession(id) {
     if (s.summary) renderSummary(s.summary);
     else $('summary-body').innerHTML = '<div class="summary-loading">No summary was saved for this call.</div>';
   } catch (err) {
-    addDebugLog(`❌ Open failed: ${err.message}`);
+    addDebugLog(`Open failed: ${err.message}`);
   }
 }
 
@@ -768,7 +825,7 @@ async function deleteSavedSession(id, card) {
     const remaining = $('library-list').querySelectorAll('.session-card').length;
     if (remaining === 0) renderLibrary([]);
   } catch (err) {
-    addDebugLog(`❌ Delete failed: ${err.message}`);
+    addDebugLog(`Delete failed: ${err.message}`);
   }
 }
 
@@ -776,7 +833,7 @@ async function deleteSavedSession(id, card) {
 async function runSynthesis() {
   const panel = $('synthesis-panel');
   panel.style.display = 'block';
-  panel.innerHTML = '<div class="loading-state"><div class="spinner"></div><span>Finding patterns across your interviews…</span></div>';
+  panel.innerHTML = '<div class="loading-state"><div class="spinner"></div><span>Finding patterns across your interviews...</span></div>';
   panel.scrollIntoView({ behavior: 'smooth' });
 
   try {
@@ -798,7 +855,7 @@ function renderSynthesis(syn, count) {
 
   const head = document.createElement('div');
   head.className = 'synthesis-head';
-  head.textContent = `✦ Synthesis across ${count} interview${count === 1 ? '' : 's'}`;
+  head.textContent = `Synthesis across ${count} interview${count === 1 ? '' : 's'}`;
   panel.appendChild(head);
 
   if (syn.overview) {
@@ -808,7 +865,6 @@ function renderSynthesis(syn, count) {
     panel.appendChild(ov);
   }
 
-  // Themes with frequency bars
   if (Array.isArray(syn.themes) && syn.themes.length) {
     const sec = document.createElement('div');
     sec.className = 'synthesis-section';
@@ -822,7 +878,7 @@ function renderSynthesis(syn, count) {
         <div class="theme-bar-wrap">
           <div class="theme-bar" style="width:${pct}%"></div>
           <div class="theme-label">${escapeHtml(t.theme || '')}</div>
-          <div class="theme-count">${t.count || 0}×</div>
+          <div class="theme-count">${t.count || 0}x</div>
         </div>
         <div class="theme-insight">${escapeHtml(t.insight || '')}${
         Array.isArray(t.interviewees) && t.interviewees.length
@@ -840,7 +896,7 @@ function renderSynthesis(syn, count) {
     const sec = document.createElement('div');
     sec.className = 'synthesis-section';
     const ul = items
-      .map((i) => `<li>${cls === 'quote' ? '“' + escapeHtml(i) + '”' : escapeHtml(i)}</li>`)
+      .map((i) => `<li>${cls === 'quote' ? '"' + escapeHtml(i) + '"' : escapeHtml(i)}</li>`)
       .join('');
     sec.innerHTML = `<div class="synthesis-section-title">${title}</div><ul class="synthesis-list ${cls || ''}">${ul}</ul>`;
     panel.appendChild(sec);
@@ -853,9 +909,7 @@ function renderSynthesis(syn, count) {
   if (syn.recommendation) {
     const rec = document.createElement('div');
     rec.className = 'synthesis-rec';
-    rec.innerHTML = `<div class="synthesis-section-title">Recommended next move</div><div class="synthesis-rec-text">${escapeHtml(
-      syn.recommendation
-    )}</div>`;
+    rec.innerHTML = `<div class="synthesis-section-title">Recommended next move</div><div class="synthesis-rec-text">${escapeHtml(syn.recommendation)}</div>`;
     panel.appendChild(rec);
   }
 }
