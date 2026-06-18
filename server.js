@@ -1,16 +1,72 @@
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Stable-ish secret for signing the session cookie. Set SESSION_SECRET in prod
+// so sessions survive restarts; otherwise we generate one per process.
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+function parseCookies(req) {
+  const out = {};
+  const raw = req.headers.cookie;
+  if (!raw) return out;
+  for (const part of raw.split(';')) {
+    const i = part.indexOf('=');
+    if (i > -1) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
+
+function signSession(obj) {
+  const body = Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+
+function verifySession(token) {
+  if (!token || !token.includes('.')) return null;
+  const [body, sig] = token.split('.');
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
+  if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+    return null;
+  }
+  try {
+    const obj = JSON.parse(Buffer.from(body, 'base64url').toString());
+    if (obj.exp && Date.now() > obj.exp) return null;
+    return obj;
+  } catch {
+    return null;
+  }
+}
+
+function getSessionUser(req) {
+  return verifySession(parseCookies(req).session);
+}
+
+// Auth is only enforced when a Google client id is configured.
+function authConfigured() {
+  const env = readEnv();
+  return !!env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_ID !== 'paste_your_client_id_here';
+}
+
+// Owner key for scoping saved sessions. 'local' when auth is off.
+function getOwner(req) {
+  if (!authConfigured()) return 'local';
+  const u = getSessionUser(req);
+  return u ? u.email : null; // null => not signed in
+}
 const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const DATA_DIR = path.join(__dirname, 'data', 'sessions');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ---- session storage (one JSON file per interview) ----
-function listSessions() {
+function listSessions(owner) {
   let files = [];
   try {
     files = fs.readdirSync(DATA_DIR).filter((f) => f.endsWith('.json'));
@@ -20,7 +76,8 @@ function listSessions() {
   const sessions = [];
   for (const f of files) {
     try {
-      sessions.push(JSON.parse(fs.readFileSync(path.join(DATA_DIR, f), 'utf-8')));
+      const s = JSON.parse(fs.readFileSync(path.join(DATA_DIR, f), 'utf-8'));
+      if (!owner || (s.owner || 'local') === owner) sessions.push(s);
     } catch {
       /* skip corrupt file */
     }
@@ -119,6 +176,11 @@ Output ONLY valid JSON in exactly this shape, no markdown, no preamble:
 {"questions": ["...", "..."], "tips": ["...", "..."]}`;
 
 async function handleQuestions(req, res) {
+  if (getOwner(req) === null) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not signed in' }));
+    return;
+  }
   const env = readEnv();
   const apiKey = env.ANTHROPIC_API_KEY;
 
@@ -217,6 +279,11 @@ Return ONLY valid JSON in exactly this shape (no markdown, no preamble):
 Keep each array item concise (one sentence). Omit an array's items only if truly nothing applies (use an empty array). Base everything on the transcript; never invent facts.`;
 
 async function handleSummary(req, res) {
+  if (getOwner(req) === null) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not signed in' }));
+    return;
+  }
   const env = readEnv();
   const apiKey = env.ANTHROPIC_API_KEY;
   if (!apiKey || apiKey === 'paste_your_key_here') {
@@ -300,23 +367,23 @@ function sendJson(res, code, obj) {
 async function handleSessions(req, res) {
   // /api/sessions            GET -> list, POST -> save
   // /api/sessions/<id>       GET -> one,  DELETE -> remove
+  const owner = getOwner(req);
+  if (owner === null) return sendJson(res, 401, { error: 'Not signed in' });
+
   const urlPath = req.url.split('?')[0];
   const idMatch = urlPath.match(/^\/api\/sessions\/([^/]+)$/);
 
   if (idMatch) {
     const id = idMatch[1];
-    if (req.method === 'GET') {
-      const s = readSession(id);
-      return s ? sendJson(res, 200, { session: s }) : sendJson(res, 404, { error: 'Not found' });
-    }
-    if (req.method === 'DELETE') {
-      return sendJson(res, 200, { ok: deleteSession(id) });
-    }
+    const s = readSession(id);
+    if (!s || (s.owner || 'local') !== owner) return sendJson(res, 404, { error: 'Not found' });
+    if (req.method === 'GET') return sendJson(res, 200, { session: s });
+    if (req.method === 'DELETE') return sendJson(res, 200, { ok: deleteSession(id) });
     return sendJson(res, 405, { error: 'Method not allowed' });
   }
 
   if (req.method === 'GET') {
-    return sendJson(res, 200, { sessions: listSessions() });
+    return sendJson(res, 200, { sessions: listSessions(owner) });
   }
   if (req.method === 'POST') {
     let payload;
@@ -325,6 +392,7 @@ async function handleSessions(req, res) {
     } catch {
       return sendJson(res, 400, { error: 'Invalid JSON body' });
     }
+    payload.owner = owner;
     const saved = writeSession(payload);
     return sendJson(res, 200, { session: saved });
   }
@@ -355,7 +423,10 @@ async function handleSynthesis(req, res) {
     return sendJson(res, 500, { error: 'ANTHROPIC_API_KEY missing in .env' });
   }
 
-  const sessions = listSessions();
+  const owner = getOwner(req);
+  if (owner === null) return sendJson(res, 401, { error: 'Not signed in' });
+
+  const sessions = listSessions(owner);
   if (sessions.length === 0) {
     return sendJson(res, 400, { error: 'No saved interviews yet' });
   }
@@ -424,12 +495,76 @@ async function handleSynthesis(req, res) {
   }
 }
 
+// ---- Auth (Google Sign-In) ----
+async function handleAuthGoogle(req, res) {
+  const env = readEnv();
+  const clientId = env.GOOGLE_CLIENT_ID;
+  if (!authConfigured()) return sendJson(res, 400, { error: 'Google login not configured' });
+
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch {
+    return sendJson(res, 400, { error: 'Invalid JSON body' });
+  }
+  const credential = payload.credential;
+  if (!credential) return sendJson(res, 400, { error: 'Missing credential' });
+
+  try {
+    // Google validates the JWT signature + expiry for us via tokeninfo
+    const info = await (
+      await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(credential)}`)
+    ).json();
+
+    if (info.error_description || !info.sub) {
+      return sendJson(res, 401, { error: 'Invalid Google token' });
+    }
+    if (info.aud !== clientId) {
+      return sendJson(res, 401, { error: 'Token audience mismatch' });
+    }
+
+    const user = {
+      email: info.email,
+      name: info.name || info.email,
+      picture: info.picture || '',
+      exp: Date.now() + SESSION_TTL_MS,
+    };
+    const token = signSession(user);
+    res.setHeader(
+      'Set-Cookie',
+      `session=${token}; HttpOnly; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}; SameSite=Lax`
+    );
+    return sendJson(res, 200, { user: { email: user.email, name: user.name, picture: user.picture } });
+  } catch (err) {
+    return sendJson(res, 502, { error: 'Google verification failed', detail: String(err) });
+  }
+}
+
+function handleMe(req, res) {
+  const u = getSessionUser(req);
+  return sendJson(res, 200, {
+    user: u ? { email: u.email, name: u.name, picture: u.picture } : null,
+  });
+}
+
+function handleLogout(req, res) {
+  res.setHeader('Set-Cookie', 'session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax');
+  return sendJson(res, 200, { ok: true });
+}
+
 function handleConfig(req, res) {
   const env = readEnv();
   const key = env.DEEPGRAM_API_KEY;
   const hasDeepgram = !!key && key !== 'paste_your_key_here';
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ hasDeepgram, deepgramKey: hasDeepgram ? key : '' }));
+  res.end(
+    JSON.stringify({
+      hasDeepgram,
+      deepgramKey: hasDeepgram ? key : '',
+      authRequired: authConfigured(),
+      googleClientId: authConfigured() ? env.GOOGLE_CLIENT_ID : '',
+    })
+  );
 }
 
 function serveStatic(req, res) {
@@ -465,6 +600,15 @@ const server = http.createServer(async (req, res) => {
   if (req.url.startsWith('/api/summary') && req.method === 'POST') {
     return handleSummary(req, res);
   }
+  if (req.url.startsWith('/api/auth/google') && req.method === 'POST') {
+    return handleAuthGoogle(req, res);
+  }
+  if (req.url.startsWith('/api/me') && req.method === 'GET') {
+    return handleMe(req, res);
+  }
+  if (req.url.startsWith('/api/logout') && req.method === 'POST') {
+    return handleLogout(req, res);
+  }
   if (req.url.startsWith('/api/synthesis') && req.method === 'POST') {
     return handleSynthesis(req, res);
   }
@@ -481,5 +625,6 @@ server.listen(PORT, () => {
   console.log(`\n  Meeting Assistant running:  http://localhost:${PORT}\n`);
   const env = readEnv();
   console.log(`  Anthropic key: ${env.ANTHROPIC_API_KEY && env.ANTHROPIC_API_KEY !== 'paste_your_key_here' ? 'loaded ✓' : 'MISSING — add to .env'}`);
-  console.log(`  Deepgram key:  ${env.DEEPGRAM_API_KEY && env.DEEPGRAM_API_KEY !== 'paste_your_key_here' ? 'loaded ✓' : 'not in .env (enter in UI)'}\n`);
+  console.log(`  Deepgram key:  ${env.DEEPGRAM_API_KEY && env.DEEPGRAM_API_KEY !== 'paste_your_key_here' ? 'loaded ✓' : 'not in .env (enter in UI)'}`);
+  console.log(`  Google login:  ${authConfigured() ? 'enabled ✓' : 'off (set GOOGLE_CLIENT_ID to enable)'}\n`);
 });

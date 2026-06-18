@@ -39,19 +39,100 @@ function updateDebugStats() {
   $('dbg-utterances').textContent = state.transcript.length;
 }
 
-// ---- Config ----
-async function loadConfig() {
+// ---- Boot + auth ----
+let currentUser = null;
+
+async function boot() {
+  let cfg = {};
   try {
-    const cfg = await (await fetch('/api/config')).json();
-    if (cfg.hasDeepgram) {
-      state.deepgramKey = cfg.deepgramKey;
-      $('deepgram-key').style.display = 'none';
-    } else {
-      $('deepgram-key').style.display = 'block';
-    }
-  } catch {
+    cfg = await (await fetch('/api/config')).json();
+  } catch {}
+
+  if (cfg.hasDeepgram) {
+    state.deepgramKey = cfg.deepgramKey;
+    $('deepgram-key').style.display = 'none';
+  } else {
     $('deepgram-key').style.display = 'block';
   }
+
+  if (cfg.authRequired) {
+    let me = {};
+    try {
+      me = await (await fetch('/api/me')).json();
+    } catch {}
+    if (me.user) {
+      currentUser = me.user;
+      showSetup();
+    } else {
+      showLogin(cfg.googleClientId);
+      return; // don't load library until signed in
+    }
+  } else {
+    showSetup();
+  }
+  refreshLibraryCount();
+}
+
+function showSetup() {
+  $('login').style.display = 'none';
+  $('setup').style.display = 'flex';
+  if (currentUser) {
+    $('user-chip').style.display = 'flex';
+    $('user-email').textContent = currentUser.email;
+  }
+}
+
+function showLogin(clientId) {
+  $('setup').style.display = 'none';
+  $('login').style.display = 'flex';
+  initGoogleButton(clientId);
+}
+
+function initGoogleButton(clientId, tries = 0) {
+  if (!window.google?.accounts?.id) {
+    if (tries < 40) return setTimeout(() => initGoogleButton(clientId, tries + 1), 100);
+    $('login-error').textContent = 'Could not load Google Sign-In. Check your connection.';
+    $('login-error').style.display = 'block';
+    return;
+  }
+  window.google.accounts.id.initialize({ client_id: clientId, callback: onGoogleCredential });
+  window.google.accounts.id.renderButton($('google-btn'), {
+    theme: 'outline',
+    size: 'large',
+    shape: 'pill',
+    width: 300,
+    text: 'continue_with',
+  });
+}
+
+async function onGoogleCredential(response) {
+  $('login-error').style.display = 'none';
+  try {
+    const res = await fetch('/api/auth/google', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ credential: response.credential }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      $('login-error').textContent = data.error || 'Sign-in failed';
+      $('login-error').style.display = 'block';
+      return;
+    }
+    currentUser = data.user;
+    showSetup();
+    refreshLibraryCount();
+  } catch (err) {
+    $('login-error').textContent = err.message;
+    $('login-error').style.display = 'block';
+  }
+}
+
+async function logout() {
+  try {
+    await fetch('/api/logout', { method: 'POST' });
+  } catch {}
+  location.reload();
 }
 
 // ---- Setup ----
@@ -315,7 +396,9 @@ function renderQuestions() {
 
   const meta = document.createElement('div');
   meta.className = 'questions-meta';
-  meta.textContent = state.questionLoading ? 'updating…' : 'click a question to pin it';
+  meta.innerHTML = state.questionLoading
+    ? '<span class="spinner spinner-sm"></span> updating…'
+    : 'click a question to pin it';
   container.appendChild(meta);
 }
 
@@ -429,7 +512,7 @@ async function generateSummary() {
     return;
   }
 
-  body.innerHTML = '<div class="summary-loading">Analyzing the conversation…</div>';
+  body.innerHTML = '<div class="loading-state"><div class="spinner"></div><span>Analyzing the conversation…</span></div>';
 
   try {
     const res = await fetch('/api/summary', {
@@ -693,7 +776,7 @@ async function deleteSavedSession(id, card) {
 async function runSynthesis() {
   const panel = $('synthesis-panel');
   panel.style.display = 'block';
-  panel.innerHTML = '<div class="synthesis-loading">Finding patterns across your interviews…</div>';
+  panel.innerHTML = '<div class="loading-state"><div class="spinner"></div><span>Finding patterns across your interviews…</span></div>';
   panel.scrollIntoView({ behavior: 'smooth' });
 
   try {
@@ -786,6 +869,7 @@ $('start-btn').addEventListener('click', startSession);
 $('open-library').addEventListener('click', openLibrary);
 $('library-back').addEventListener('click', closeLibrary);
 $('synthesize-btn').addEventListener('click', runSynthesis);
+$('logout-btn').addEventListener('click', logout);
 $('stop-btn').addEventListener('click', stopSession);
 $('export-btn').addEventListener('click', downloadTranscript);
 $('dl-transcript').addEventListener('click', downloadTranscript);
@@ -804,5 +888,4 @@ $('debug-toggle').addEventListener('click', () => {
   });
 });
 
-loadConfig();
-refreshLibraryCount();
+boot();
