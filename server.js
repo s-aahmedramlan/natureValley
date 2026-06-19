@@ -1,16 +1,122 @@
+import 'dotenv/config';
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import pg from 'pg';
 
+const { Pool } = pg;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Stable-ish secret for signing the session cookie. Set SESSION_SECRET in prod
-// so sessions survive restarts; otherwise we generate one per process.
+// ---- Session signing ----
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
+if (!process.env.SESSION_SECRET) {
+  console.warn('  [warn] SESSION_SECRET not set - sessions will not survive restarts');
+}
+
+// ---- Postgres ----
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id         TEXT        PRIMARY KEY,
+      owner      TEXT        NOT NULL,
+      data       JSONB       NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS sessions_owner_idx
+      ON sessions (owner, created_at DESC)
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS votes (
+      feature    TEXT        NOT NULL,
+      voter      TEXT        NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (feature, voter)
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS usage (
+      user_email      TEXT NOT NULL,
+      date            DATE NOT NULL,
+      questions_calls INT  NOT NULL DEFAULT 0,
+      summary_calls   INT  NOT NULL DEFAULT 0,
+      synthesis_calls INT  NOT NULL DEFAULT 0,
+      PRIMARY KEY (user_email, date)
+    )
+  `);
+}
+
+// ---- Rate limiting ----
+const RATE_LIMITS = { questions: 100, summary: 10, synthesis: 3 };
+const RATE_MESSAGES = {
+  questions: 'Daily limit reached for question suggestions (100/day). Resets at midnight UTC.',
+  summary:   'Daily limit reached for session summaries (10/day). Resets at midnight UTC.',
+  synthesis: 'Daily limit reached for cross-interview synthesis (3/day). Resets at midnight UTC.',
+};
+
+async function checkRateLimit(email, endpoint) {
+  if (!email || email === 'local') return true; // no limit for local mode
+  const today = new Date().toISOString().slice(0, 10);
+  const col = `${endpoint}_calls`;
+  const limit = RATE_LIMITS[endpoint];
+
+  // Ensure row exists
+  await pool.query(
+    `INSERT INTO usage (user_email, date) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+    [email, today]
+  );
+  // Atomically increment only if under limit
+  const res = await pool.query(
+    `UPDATE usage SET ${col} = ${col} + 1
+     WHERE user_email = $1 AND date = $2 AND ${col} < $3
+     RETURNING ${col}`,
+    [email, today, limit]
+  );
+  return res.rowCount > 0;
+}
+
+// ---- Session storage ----
+async function listSessions(owner) {
+  const res = await pool.query(
+    'SELECT data FROM sessions WHERE owner = $1 ORDER BY created_at DESC',
+    [owner]
+  );
+  return res.rows.map((r) => r.data);
+}
+
+async function readSession(id) {
+  const safe = String(id).replace(/[^a-z0-9_-]/gi, '');
+  const res = await pool.query('SELECT data FROM sessions WHERE id = $1', [safe]);
+  return res.rows[0]?.data || null;
+}
+
+async function writeSession(session) {
+  const id = session.id || `s_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const safe = id.replace(/[^a-z0-9_-]/gi, '');
+  const record = { ...session, id: safe, createdAt: session.createdAt || new Date().toISOString() };
+  await pool.query(
+    `INSERT INTO sessions (id, owner, data, created_at)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data`,
+    [safe, record.owner || 'local', record, record.createdAt]
+  );
+  return record;
+}
+
+async function deleteSession(id) {
+  const safe = String(id).replace(/[^a-z0-9_-]/gi, '');
+  const res = await pool.query('DELETE FROM sessions WHERE id = $1', [safe]);
+  return res.rowCount > 0;
+}
+
+// ---- Auth helpers ----
 function parseCookies(req) {
   const out = {};
   const raw = req.headers.cookie;
@@ -48,88 +154,20 @@ function getSessionUser(req) {
   return verifySession(parseCookies(req).session);
 }
 
-// Auth is only enforced when a Google client id is configured.
 function authConfigured() {
-  const env = readEnv();
-  return !!env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_ID !== 'paste_your_client_id_here';
+  const id = process.env.GOOGLE_CLIENT_ID;
+  return !!id && id !== 'paste_your_client_id_here';
 }
 
-// Owner key for scoping saved sessions. 'local' when auth is off.
 function getOwner(req) {
   if (!authConfigured()) return 'local';
   const u = getSessionUser(req);
-  return u ? u.email : null; // null => not signed in
+  return u ? u.email : null;
 }
+
+// ---- HTTP helpers ----
 const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
-const DATA_DIR = path.join(__dirname, 'data', 'sessions');
-fs.mkdirSync(DATA_DIR, { recursive: true });
-
-// ---- session storage (one JSON file per interview) ----
-function listSessions(owner) {
-  let files = [];
-  try {
-    files = fs.readdirSync(DATA_DIR).filter((f) => f.endsWith('.json'));
-  } catch {
-    return [];
-  }
-  const sessions = [];
-  for (const f of files) {
-    try {
-      const s = JSON.parse(fs.readFileSync(path.join(DATA_DIR, f), 'utf-8'));
-      if (!owner || (s.owner || 'local') === owner) sessions.push(s);
-    } catch {
-      /* skip corrupt file */
-    }
-  }
-  // newest first
-  sessions.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
-  return sessions;
-}
-
-function readSession(id) {
-  const safe = String(id).replace(/[^a-z0-9_-]/gi, '');
-  try {
-    return JSON.parse(fs.readFileSync(path.join(DATA_DIR, `${safe}.json`), 'utf-8'));
-  } catch {
-    return null;
-  }
-}
-
-function writeSession(session) {
-  const id = session.id || `s_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const safe = id.replace(/[^a-z0-9_-]/gi, '');
-  const record = { ...session, id: safe, createdAt: session.createdAt || new Date().toISOString() };
-  fs.writeFileSync(path.join(DATA_DIR, `${safe}.json`), JSON.stringify(record, null, 2));
-  return record;
-}
-
-function deleteSession(id) {
-  const safe = String(id).replace(/[^a-z0-9_-]/gi, '');
-  try {
-    fs.unlinkSync(path.join(DATA_DIR, `${safe}.json`));
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// ---- env: read fresh from .env on every access so key changes never go stale ----
-function readEnv() {
-  const out = {};
-  for (const file of ['.env', '.env.local']) {
-    try {
-      const content = fs.readFileSync(path.join(__dirname, file), 'utf-8');
-      for (const line of content.split('\n')) {
-        const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
-        if (m) out[m[1]] = m[2].trim();
-      }
-    } catch {
-      /* file may not exist */
-    }
-  }
-  return out;
-}
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -140,10 +178,14 @@ const MIME = {
 };
 
 function noCache(res) {
-  // Force the browser to always fetch fresh code — kills the stale-cache class of bugs
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
+}
+
+function sendJson(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(obj));
 }
 
 function readBody(req) {
@@ -155,6 +197,7 @@ function readBody(req) {
   });
 }
 
+// ---- Prompts ----
 const SYSTEM_PROMPT = `You are an expert research assistant sitting beside an interviewer during a live customer discovery call. You help them ask sharp, unbiased follow-up questions and stay one step ahead on domain knowledge.
 
 Your PRIME DIRECTIVE is discovery, not confirmation. The goal is to uncover ANY real problem in the interviewee's world — not to keep drilling into the first or most obvious thing they mentioned. Avoid leading the witness. Follow the interviewee's reality, not the interviewer's assumptions.
@@ -175,92 +218,6 @@ You receive what the INTERVIEWEE has said so far (and optional background notes)
 Output ONLY valid JSON in exactly this shape, no markdown, no preamble:
 {"questions": ["...", "..."], "tips": ["...", "..."]}`;
 
-async function handleQuestions(req, res) {
-  if (getOwner(req) === null) {
-    res.writeHead(401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not signed in' }));
-    return;
-  }
-  const env = readEnv();
-  const apiKey = env.ANTHROPIC_API_KEY;
-
-  if (!apiKey || apiKey === 'paste_your_key_here') {
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'ANTHROPIC_API_KEY missing in .env' }));
-    return;
-  }
-
-  let payload;
-  try {
-    payload = JSON.parse(await readBody(req));
-  } catch {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Invalid JSON body' }));
-    return;
-  }
-
-  const { intervieweeLines = '', premeetingNotes = '' } = payload;
-  let system = SYSTEM_PROMPT;
-  if (premeetingNotes.trim()) {
-    system += `\n\nBackground context about the interviewee (use this to inform your questions about known pain points and priorities):\n${premeetingNotes}`;
-  }
-
-  try {
-    const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 512,
-        system,
-        messages: [
-          {
-            role: 'user',
-            content: `Here is what the interviewee has said so far. Generate the follow-up questions and tips:\n\n${intervieweeLines}`,
-          },
-        ],
-      }),
-    });
-
-    const text = await apiRes.text();
-    if (!apiRes.ok) {
-      res.writeHead(apiRes.status, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: `Anthropic ${apiRes.status}`, detail: text.slice(0, 300) }));
-      return;
-    }
-
-    const data = JSON.parse(text);
-    const content = data.content?.[0]?.text || '';
-    let parsed;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      // Model sometimes wraps in prose — extract the first JSON object
-      const m = content.match(/\{[\s\S]*\}/);
-      parsed = m ? JSON.parse(m[0]) : null;
-    }
-
-    const questions = Array.isArray(parsed?.questions) ? parsed.questions.slice(0, 2) : null;
-    const tips = Array.isArray(parsed?.tips) ? parsed.tips.slice(0, 3) : [];
-
-    if (!questions || questions.length < 1) {
-      res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Could not parse questions', raw: content }));
-      return;
-    }
-
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ questions, tips }));
-  } catch (err) {
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Request to Anthropic failed', detail: String(err) }));
-  }
-}
-
 const SUMMARY_PROMPT = `You are a customer-discovery analyst. You are given the full transcript of a discovery interview (with speaker labels) and optional pre-meeting notes. Produce a sharp, founder-ready debrief.
 
 Be objective and evidence-based. Do NOT flatter the interviewer's idea or assume their hypothesis is correct — your job is to capture what was actually learned, including signals that CHALLENGE the idea.
@@ -278,35 +235,119 @@ Return ONLY valid JSON in exactly this shape (no markdown, no preamble):
 }
 Keep each array item concise (one sentence). Omit an array's items only if truly nothing applies (use an empty array). Base everything on the transcript; never invent facts.`;
 
-async function handleSummary(req, res) {
-  if (getOwner(req) === null) {
-    res.writeHead(401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not signed in' }));
-    return;
+const SYNTHESIS_PROMPT = `You are a customer-discovery analyst helping an early-stage founder make sense of MULTIPLE discovery interviews at once. You receive the interviewee name, a one-sentence summary, and their key pain points from each interview.
+
+Your job: identify the top pain points that appear across multiple interviews, rank by frequency and severity, and give an honest read on what the pattern means. Be rigorous — an early founder needs the truth, not encouragement.
+
+Return ONLY valid JSON in exactly this shape (no markdown, no preamble):
+{
+  "overview": "3-4 sentence narrative of what the interviews collectively reveal",
+  "themes": [
+    {"theme": "short name of the recurring pain point", "count": <number of interviewees who raised it>, "interviewees": ["names"], "insight": "one sentence on what it means"}
+  ],
+  "validated": ["pain points with strong, repeated evidence across multiple interviewees"],
+  "weakOrContradictory": ["pain points mentioned only once, or that contradict each other"],
+  "recommendation": "2-3 sentences: what the founder should do next — dig deeper, build, narrow segment, or pivot"
+}
+Order "themes" by count, highest first. Only count an interviewee toward a theme if their pain points genuinely support it. Never invent interviewees or quotes.`;
+
+// ---- Route handlers ----
+async function handleQuestions(req, res) {
+  const owner = getOwner(req);
+  if (owner === null) return sendJson(res, 401, { error: 'Not signed in' });
+  if (!await checkRateLimit(owner, 'questions')) {
+    return sendJson(res, 429, { error: RATE_MESSAGES.questions });
   }
-  const env = readEnv();
-  const apiKey = env.ANTHROPIC_API_KEY;
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || apiKey === 'paste_your_key_here') {
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'ANTHROPIC_API_KEY missing in .env' }));
-    return;
+    return sendJson(res, 500, { error: 'ANTHROPIC_API_KEY not configured' });
   }
 
   let payload;
   try {
     payload = JSON.parse(await readBody(req));
   } catch {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Invalid JSON body' }));
-    return;
+    return sendJson(res, 400, { error: 'Invalid JSON body' });
+  }
+
+  const { intervieweeLines = '', premeetingNotes = '' } = payload;
+  let system = SYSTEM_PROMPT;
+  if (premeetingNotes.trim()) {
+    system += `\n\nBackground context about the interviewee:\n${premeetingNotes}`;
+  }
+
+  try {
+    const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 512,
+        system,
+        messages: [
+          {
+            role: 'user',
+            content: `Here is what the interviewee has said so far. Generate the follow-up questions and tips:\n\n${intervieweeLines}`,
+          },
+        ],
+      }),
+    });
+
+    const text = await apiRes.text();
+    if (!apiRes.ok) {
+      console.error(`Anthropic ${apiRes.status}:`, text.slice(0, 500));
+      return sendJson(res, apiRes.status, { error: `Anthropic ${apiRes.status}`, detail: text.slice(0, 300) });
+    }
+
+    const data = JSON.parse(text);
+    const content = data.content?.[0]?.text || '';
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      const m = content.match(/\{[\s\S]*\}/);
+      parsed = m ? JSON.parse(m[0]) : null;
+    }
+
+    const questions = Array.isArray(parsed?.questions) ? parsed.questions.slice(0, 2) : null;
+    const tips = Array.isArray(parsed?.tips) ? parsed.tips.slice(0, 3) : [];
+
+    if (!questions || questions.length < 1) {
+      return sendJson(res, 502, { error: 'Could not parse questions', raw: content });
+    }
+
+    return sendJson(res, 200, { questions, tips });
+  } catch (err) {
+    return sendJson(res, 502, { error: 'Request to Anthropic failed', detail: String(err) });
+  }
+}
+
+async function handleSummary(req, res) {
+  const owner = getOwner(req);
+  if (owner === null) return sendJson(res, 401, { error: 'Not signed in' });
+  if (!await checkRateLimit(owner, 'summary')) {
+    return sendJson(res, 429, { error: RATE_MESSAGES.summary });
+  }
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey || apiKey === 'paste_your_key_here') {
+    return sendJson(res, 500, { error: 'ANTHROPIC_API_KEY not configured' });
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch {
+    return sendJson(res, 400, { error: 'Invalid JSON body' });
   }
 
   const { transcript = '', premeetingNotes = '' } = payload;
-  if (!transcript.trim()) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Empty transcript' }));
-    return;
-  }
+  if (!transcript.trim()) return sendJson(res, 400, { error: 'Empty transcript' });
 
   let userContent = `Transcript:\n\n${transcript}`;
   if (premeetingNotes.trim()) userContent += `\n\nPre-meeting notes:\n${premeetingNotes}`;
@@ -320,7 +361,7 @@ async function handleSummary(req, res) {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-5',
         max_tokens: 1024,
         system: SUMMARY_PROMPT,
         messages: [{ role: 'user', content: userContent }],
@@ -329,9 +370,8 @@ async function handleSummary(req, res) {
 
     const text = await apiRes.text();
     if (!apiRes.ok) {
-      res.writeHead(apiRes.status, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: `Anthropic ${apiRes.status}`, detail: text.slice(0, 300) }));
-      return;
+      console.error(`Anthropic ${apiRes.status}:`, text.slice(0, 500));
+      return sendJson(res, apiRes.status, { error: `Anthropic ${apiRes.status}`, detail: text.slice(0, 300) });
     }
 
     const data = JSON.parse(text);
@@ -345,110 +385,44 @@ async function handleSummary(req, res) {
     }
 
     if (!parsed || typeof parsed !== 'object') {
-      res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Could not parse summary', raw: content }));
-      return;
+      return sendJson(res, 502, { error: 'Could not parse summary', raw: content });
     }
 
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ summary: parsed }));
+    return sendJson(res, 200, { summary: parsed });
   } catch (err) {
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Request to Anthropic failed', detail: String(err) }));
+    return sendJson(res, 502, { error: 'Request to Anthropic failed', detail: String(err) });
   }
 }
-
-// ---- Sessions API ----
-function sendJson(res, code, obj) {
-  res.writeHead(code, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(obj));
-}
-
-async function handleSessions(req, res) {
-  // /api/sessions            GET -> list, POST -> save
-  // /api/sessions/<id>       GET -> one,  DELETE -> remove
-  const owner = getOwner(req);
-  if (owner === null) return sendJson(res, 401, { error: 'Not signed in' });
-
-  const urlPath = req.url.split('?')[0];
-  const idMatch = urlPath.match(/^\/api\/sessions\/([^/]+)$/);
-
-  if (idMatch) {
-    const id = idMatch[1];
-    const s = readSession(id);
-    if (!s || (s.owner || 'local') !== owner) return sendJson(res, 404, { error: 'Not found' });
-    if (req.method === 'GET') return sendJson(res, 200, { session: s });
-    if (req.method === 'DELETE') return sendJson(res, 200, { ok: deleteSession(id) });
-    return sendJson(res, 405, { error: 'Method not allowed' });
-  }
-
-  if (req.method === 'GET') {
-    return sendJson(res, 200, { sessions: listSessions(owner) });
-  }
-  if (req.method === 'POST') {
-    let payload;
-    try {
-      payload = JSON.parse(await readBody(req));
-    } catch {
-      return sendJson(res, 400, { error: 'Invalid JSON body' });
-    }
-    payload.owner = owner;
-    const saved = writeSession(payload);
-    return sendJson(res, 200, { session: saved });
-  }
-  return sendJson(res, 405, { error: 'Method not allowed' });
-}
-
-const SYNTHESIS_PROMPT = `You are a customer-discovery analyst helping an early-stage founder make sense of MULTIPLE discovery interviews at once. You receive condensed summaries of every interview conducted so far.
-
-Your job is pattern detection across interviews, not re-summarizing each one. Be rigorous and honest — an early founder needs the truth, not encouragement. Surface where evidence is strong AND where it is thin or contradictory.
-
-Return ONLY valid JSON in exactly this shape (no markdown, no preamble):
-{
-  "overview": "3-4 sentence narrative of what the interviews collectively reveal",
-  "themes": [
-    {"theme": "short name of the recurring problem/need", "count": <number of interviewees who raised it>, "interviewees": ["names"], "insight": "one sentence on what it means"}
-  ],
-  "topQuotes": ["the most revealing verbatim quotes across all interviews"],
-  "validated": ["patterns with strong, repeated evidence across interviewees"],
-  "weakOrContradictory": ["assumptions that are unsupported, only mentioned once, or contradicted"],
-  "recommendation": "2-3 sentences: what the founder should do next — dig deeper, build, narrow segment, or pivot"
-}
-Order "themes" by count, highest first. Only count an interviewee toward a theme if their summary genuinely supports it. Never invent interviewees or quotes.`;
 
 async function handleSynthesis(req, res) {
-  const env = readEnv();
-  const apiKey = env.ANTHROPIC_API_KEY;
-  if (!apiKey || apiKey === 'paste_your_key_here') {
-    return sendJson(res, 500, { error: 'ANTHROPIC_API_KEY missing in .env' });
-  }
-
   const owner = getOwner(req);
   if (owner === null) return sendJson(res, 401, { error: 'Not signed in' });
+  if (!await checkRateLimit(owner, 'synthesis')) {
+    return sendJson(res, 429, { error: RATE_MESSAGES.synthesis });
+  }
 
-  const sessions = listSessions(owner);
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey || apiKey === 'paste_your_key_here') {
+    return sendJson(res, 500, { error: 'ANTHROPIC_API_KEY not configured' });
+  }
+
+  const sessions = await listSessions(owner);
   if (sessions.length === 0) {
     return sendJson(res, 400, { error: 'No saved interviews yet' });
   }
 
-  // Condense each interview to its summary so we stay within token budget
+  // Send only pain points + tldr — ~90% cheaper than full transcripts
   const condensed = sessions
     .map((s, i) => {
       const sum = s.summary || {};
-      const part = (label, arr) =>
-        Array.isArray(arr) && arr.length ? `${label}: ${arr.join('; ')}` : '';
-      return [
+      const lines = [
         `INTERVIEW ${i + 1} — ${s.interviewee || 'Unknown'} (${s.date || ''})`,
-        sum.tldr ? `TL;DR: ${sum.tldr}` : '',
-        part('Pain points', sum.painPoints),
-        part('Jobs to be done', sum.jobsToBeDone),
-        part('Current solutions', sum.currentSolutions),
-        part('Demand signals', sum.signals),
-        part('Risks', sum.risks),
-        part('Quotes', sum.quotes),
-      ]
-        .filter(Boolean)
-        .join('\n');
+      ];
+      if (sum.tldr) lines.push(`Summary: ${sum.tldr}`);
+      if (Array.isArray(sum.painPoints) && sum.painPoints.length) {
+        lines.push(`Pain points: ${sum.painPoints.join('; ')}`);
+      }
+      return lines.join('\n');
     })
     .join('\n\n---\n\n');
 
@@ -461,13 +435,13 @@ async function handleSynthesis(req, res) {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-5',
         max_tokens: 1536,
         system: SYNTHESIS_PROMPT,
         messages: [
           {
             role: 'user',
-            content: `Here are summaries of ${sessions.length} discovery interviews. Synthesize the patterns:\n\n${condensed}`,
+            content: `Here are pain-point summaries from ${sessions.length} discovery interview${sessions.length === 1 ? '' : 's'}. Identify the top pain points across interviews:\n\n${condensed}`,
           },
         ],
       }),
@@ -475,6 +449,7 @@ async function handleSynthesis(req, res) {
 
     const text = await apiRes.text();
     if (!apiRes.ok) {
+      console.error(`Anthropic ${apiRes.status}:`, text.slice(0, 500));
       return sendJson(res, apiRes.status, { error: `Anthropic ${apiRes.status}`, detail: text.slice(0, 300) });
     }
 
@@ -495,10 +470,72 @@ async function handleSynthesis(req, res) {
   }
 }
 
-// ---- Auth (Google Sign-In) ----
+async function handleVote(req, res) {
+  const owner = getOwner(req);
+  if (owner === null) return sendJson(res, 401, { error: 'Not signed in' });
+
+  const feature = 'mac-app';
+
+  if (req.method === 'GET') {
+    const [countRes, votedRes] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM votes WHERE feature = $1', [feature]),
+      pool.query('SELECT 1 FROM votes WHERE feature = $1 AND voter = $2', [feature, owner]),
+    ]);
+    return sendJson(res, 200, {
+      count: parseInt(countRes.rows[0].count, 10),
+      hasVoted: votedRes.rows.length > 0,
+    });
+  }
+
+  if (req.method === 'POST') {
+    const votedRes = await pool.query('SELECT 1 FROM votes WHERE feature = $1 AND voter = $2', [feature, owner]);
+    if (votedRes.rows.length > 0) {
+      await pool.query('DELETE FROM votes WHERE feature = $1 AND voter = $2', [feature, owner]);
+    } else {
+      await pool.query('INSERT INTO votes (feature, voter) VALUES ($1, $2)', [feature, owner]);
+    }
+    const countRes = await pool.query('SELECT COUNT(*) FROM votes WHERE feature = $1', [feature]);
+    const hasVoted = votedRes.rows.length === 0; // flipped since we just toggled
+    return sendJson(res, 200, { count: parseInt(countRes.rows[0].count, 10), hasVoted });
+  }
+
+  return sendJson(res, 405, { error: 'Method not allowed' });
+}
+
+async function handleSessions(req, res) {
+  const owner = getOwner(req);
+  if (owner === null) return sendJson(res, 401, { error: 'Not signed in' });
+
+  const urlPath = req.url.split('?')[0];
+  const idMatch = urlPath.match(/^\/api\/sessions\/([^/]+)$/);
+
+  if (idMatch) {
+    const id = idMatch[1];
+    const s = await readSession(id);
+    if (!s || (s.owner || 'local') !== owner) return sendJson(res, 404, { error: 'Not found' });
+    if (req.method === 'GET') return sendJson(res, 200, { session: s });
+    if (req.method === 'DELETE') return sendJson(res, 200, { ok: await deleteSession(id) });
+    return sendJson(res, 405, { error: 'Method not allowed' });
+  }
+
+  if (req.method === 'GET') {
+    return sendJson(res, 200, { sessions: await listSessions(owner) });
+  }
+  if (req.method === 'POST') {
+    let payload;
+    try {
+      payload = JSON.parse(await readBody(req));
+    } catch {
+      return sendJson(res, 400, { error: 'Invalid JSON body' });
+    }
+    payload.owner = owner;
+    const saved = await writeSession(payload);
+    return sendJson(res, 200, { session: saved });
+  }
+  return sendJson(res, 405, { error: 'Method not allowed' });
+}
+
 async function handleAuthGoogle(req, res) {
-  const env = readEnv();
-  const clientId = env.GOOGLE_CLIENT_ID;
   if (!authConfigured()) return sendJson(res, 400, { error: 'Google login not configured' });
 
   let payload;
@@ -507,11 +544,11 @@ async function handleAuthGoogle(req, res) {
   } catch {
     return sendJson(res, 400, { error: 'Invalid JSON body' });
   }
+
   const credential = payload.credential;
   if (!credential) return sendJson(res, 400, { error: 'Missing credential' });
 
   try {
-    // Google validates the JWT signature + expiry for us via tokeninfo
     const info = await (
       await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(credential)}`)
     ).json();
@@ -519,7 +556,7 @@ async function handleAuthGoogle(req, res) {
     if (info.error_description || !info.sub) {
       return sendJson(res, 401, { error: 'Invalid Google token' });
     }
-    if (info.aud !== clientId) {
+    if (info.aud !== process.env.GOOGLE_CLIENT_ID) {
       return sendJson(res, 401, { error: 'Token audience mismatch' });
     }
 
@@ -553,25 +590,20 @@ function handleLogout(req, res) {
 }
 
 function handleConfig(req, res) {
-  const env = readEnv();
-  const key = env.DEEPGRAM_API_KEY;
+  const key = process.env.DEEPGRAM_API_KEY;
   const hasDeepgram = !!key && key !== 'paste_your_key_here';
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(
-    JSON.stringify({
-      hasDeepgram,
-      deepgramKey: hasDeepgram ? key : '',
-      authRequired: authConfigured(),
-      googleClientId: authConfigured() ? env.GOOGLE_CLIENT_ID : '',
-    })
-  );
+  return sendJson(res, 200, {
+    hasDeepgram,
+    deepgramKey: hasDeepgram ? key : '',
+    authRequired: authConfigured(),
+    googleClientId: authConfigured() ? process.env.GOOGLE_CLIENT_ID : '',
+  });
 }
 
 function serveStatic(req, res) {
   let urlPath = decodeURIComponent(req.url.split('?')[0]);
   if (urlPath === '/') urlPath = '/index.html';
 
-  // prevent path traversal
   const filePath = path.join(PUBLIC_DIR, path.normalize(urlPath).replace(/^(\.\.[/\\])+/, ''));
   if (!filePath.startsWith(PUBLIC_DIR)) {
     res.writeHead(403);
@@ -591,40 +623,38 @@ function serveStatic(req, res) {
   });
 }
 
+// ---- Router ----
 const server = http.createServer(async (req, res) => {
   noCache(res);
-
-  if (req.url.startsWith('/api/questions') && req.method === 'POST') {
-    return handleQuestions(req, res);
+  try {
+    if (req.url.startsWith('/api/questions')   && req.method === 'POST') return await handleQuestions(req, res);
+    if (req.url.startsWith('/api/summary')     && req.method === 'POST') return await handleSummary(req, res);
+    if (req.url.startsWith('/api/auth/google') && req.method === 'POST') return await handleAuthGoogle(req, res);
+    if (req.url.startsWith('/api/me')          && req.method === 'GET')  return handleMe(req, res);
+    if (req.url.startsWith('/api/logout')      && req.method === 'POST') return handleLogout(req, res);
+    if (req.url.startsWith('/api/synthesis')   && req.method === 'POST') return await handleSynthesis(req, res);
+    if (req.url.startsWith('/api/sessions'))                              return await handleSessions(req, res);
+    if (req.url.startsWith('/api/vote'))                                  return await handleVote(req, res);
+    if (req.url.startsWith('/api/config')      && req.method === 'GET')  return handleConfig(req, res);
+    return serveStatic(req, res);
+  } catch (err) {
+    console.error('Unhandled error:', err);
+    if (!res.headersSent) sendJson(res, 500, { error: 'Internal server error' });
   }
-  if (req.url.startsWith('/api/summary') && req.method === 'POST') {
-    return handleSummary(req, res);
-  }
-  if (req.url.startsWith('/api/auth/google') && req.method === 'POST') {
-    return handleAuthGoogle(req, res);
-  }
-  if (req.url.startsWith('/api/me') && req.method === 'GET') {
-    return handleMe(req, res);
-  }
-  if (req.url.startsWith('/api/logout') && req.method === 'POST') {
-    return handleLogout(req, res);
-  }
-  if (req.url.startsWith('/api/synthesis') && req.method === 'POST') {
-    return handleSynthesis(req, res);
-  }
-  if (req.url.startsWith('/api/sessions')) {
-    return handleSessions(req, res);
-  }
-  if (req.url.startsWith('/api/config') && req.method === 'GET') {
-    return handleConfig(req, res);
-  }
-  return serveStatic(req, res);
 });
 
-server.listen(PORT, () => {
-  console.log(`\n  Meeting Assistant running:  http://localhost:${PORT}\n`);
-  const env = readEnv();
-  console.log(`  Anthropic key: ${env.ANTHROPIC_API_KEY && env.ANTHROPIC_API_KEY !== 'paste_your_key_here' ? 'loaded ✓' : 'MISSING — add to .env'}`);
-  console.log(`  Deepgram key:  ${env.DEEPGRAM_API_KEY && env.DEEPGRAM_API_KEY !== 'paste_your_key_here' ? 'loaded ✓' : 'not in .env (enter in UI)'}`);
-  console.log(`  Google login:  ${authConfigured() ? 'enabled ✓' : 'off (set GOOGLE_CLIENT_ID to enable)'}\n`);
-});
+// ---- Boot ----
+initDb()
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log(`\n  Discovery Assistant running: http://localhost:${PORT}\n`);
+      console.log(`  Anthropic key: ${process.env.ANTHROPIC_API_KEY ? 'loaded' : 'MISSING'}`);
+      console.log(`  Deepgram key:  ${process.env.DEEPGRAM_API_KEY  ? 'loaded' : 'not set (enter in UI)'}`);
+      console.log(`  Google login:  ${authConfigured() ? 'enabled' : 'off (set GOOGLE_CLIENT_ID to enable)'}`);
+      console.log(`  Database:      connected\n`);
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to connect to database:', err.message);
+    process.exit(1);
+  });

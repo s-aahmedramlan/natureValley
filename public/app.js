@@ -541,11 +541,11 @@ function renderTips() {
 // ---- Stop / Download ----
 function stopSession() {
   conns.forEach((c) => {
-    try {
-      c.processor?.disconnect();
-      c.audioContext?.close();
-      c.ws?.close();
-    } catch {}
+    try { c.processor?.disconnect(); } catch {}
+    if (c.audioContext && c.audioContext.state !== 'closed') {
+      c.audioContext.close().catch(() => {});
+    }
+    try { c.ws?.close(); } catch {}
   });
   if (micStream) micStream.getTracks().forEach((t) => t.stop());
   if (displayStream) displayStream.getTracks().forEach((t) => t.stop());

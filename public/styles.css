@@ -1168,6 +1168,27 @@ body {
   border-bottom: 1px solid var(--line);
 }
 
+.summary-close-btn {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s;
+  margin-top: -2px;
+}
+
+.summary-close-btn:hover {
+  background: var(--line);
+  color: var(--ink);
+}
+
 .summary-title {
   font-size: 21px;
   font-weight: 700;
