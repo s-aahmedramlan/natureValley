@@ -439,12 +439,11 @@ function renderQuestions() {
     p.textContent = `${i + 1}. ${q.text}`;
     card.appendChild(p);
 
-    if (q.pinned) {
-      const badge = document.createElement('span');
-      badge.className = 'pin-badge';
-      badge.textContent = 'pinned';
-      card.appendChild(badge);
-    }
+    const badge = document.createElement('span');
+    badge.className = 'pin-badge' + (q.pinned ? ' is-pinned' : '');
+    badge.innerHTML = '📌';
+    badge.title = q.pinned ? 'Unpin' : 'Pin';
+    card.appendChild(badge);
 
     card.onclick = () => {
       q.pinned = !q.pinned;
